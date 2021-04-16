@@ -47,6 +47,7 @@ rcsid[] = "$Id: i_x.c,v 1.6 1997/02/03 22:45:10 b1 Exp $";
 #include <sys/socket.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
+#include <math.h>
 
 //#define CMAP256
 
@@ -73,6 +74,9 @@ int fd_fb = 0;
 
 int	X_width;
 int X_height;
+
+        int* g_px1ab = NULL;
+        int g_px1ab_w = 0;
 
 // If true, game is running as a screensaver
 
@@ -405,6 +409,137 @@ void I_FinishUpdate (void)
     int y;
     int x_offset, y_offset, x_offset_end;
     unsigned char *line_in, *line_out;
+
+    if (fb_scaling <= 0) {
+        float scaling = (float)fb.xres / (float)SCREENWIDTH;
+        if ((float)fb.yres / (float)SCREENHEIGHT < scaling) {
+            scaling = (float)fb.yres / (float)SCREENHEIGHT;
+        }
+
+        int w1 = SCREENWIDTH;
+        int h1 = SCREENHEIGHT;
+        int w2 = (float)w1 * scaling;
+        int h2 = (float)h1 * scaling;
+
+        byte *dsrc  = I_VideoBuffer;
+        byte *ddest = I_VideoBuffer_FB;
+        ddest += ((fb.yres - h2) / 2) * (fb.xres * (fb.bits_per_pixel/8));
+
+        bool bUpsampleX = (w1 < w2);
+        bool bUpsampleY = (h1 < h2);
+
+        // If too many input pixels map to one output pixel, our 32-bit accumulation values
+        // could overflow - so, if we have huge mappings like that, cut down the weights:
+        //    256 max color value
+        //   *256 weight_x
+        //   *256 weight_y
+        //   *256 (16*16) maximum # of input pixels (x,y) - unless we cut the weights down...
+        int weight_shift = 0;
+        float source_texels_per_out_pixel = (   (w1/(float)w2 + 1) 
+                                              * (h1/(float)h2 + 1)
+                                            );
+        float weight_per_pixel = source_texels_per_out_pixel * 256 * 256;  //weight_x * weight_y
+        float accum_per_pixel = weight_per_pixel*256; //color value is 0-255
+        float weight_div = accum_per_pixel / 4294967000.0f;
+        if (weight_div > 1)
+            weight_shift = (int)ceilf( logf((float)weight_div)/logf(2.0f) );
+        weight_shift = 15 < weight_shift ? 15 : weight_shift; // this could go to 15 and still be ok.
+
+        float fh = 256*h1/(float)h2;
+        float fw = 256*w1/(float)w2;
+
+
+            // cache x1a, x1b for all the columns:
+            // ...and your OS better have garbage collection on process exit :)
+            if (g_px1ab_w < w2) {
+                if (g_px1ab) free(g_px1ab);
+                g_px1ab = (int*)malloc(w2*2 * 2 * sizeof(int));
+                g_px1ab_w = w2*2;
+            }
+            for (int x2=0; x2<w2; x2++) {
+                // find the x-range of input pixels that will contribute:
+                int x1a = (int)((x2  )*fw); 
+                int x1b = (int)((x2+1)*fw); 
+                if (bUpsampleX) // map to same pixel -> we want to interpolate between two pixels!
+                    x1b = x1a + 256;
+                x1b = (x1b < (256*w1 - 1)) ? x1b : (256*w1 - 1);
+                g_px1ab[x2*2+0] = x1a;
+                g_px1ab[x2*2+1] = x1b;
+            }
+
+            // FOR EVERY OUTPUT PIXEL
+            for (int y2=0; y2<h2; y2++) {
+                // find the y-range of input pixels that will contribute:
+                int y1a = (int)((y2  )*fh); 
+                int y1b = (int)((y2+1)*fh); 
+                if (bUpsampleY) // map to same pixel -> we want to interpolate between two pixels!
+                    y1b = y1a + 256;
+                y1b = (y1b < (256*h1 - 1)) ? y1b : (256*h1 - 1);
+                int y1c = y1a >> 8;
+                int y1d = y1b >> 8;
+
+                for (int x2=0; x2<w2; x2++)
+                {
+                    // find the x-range of input pixels that will contribute:
+                    int x1a = g_px1ab[x2*2+0];    // (computed earlier)
+                    int x1b = g_px1ab[x2*2+1];    // (computed earlier)
+                    int x1c = x1a >> 8;
+                    int x1d = x1b >> 8;
+
+                    // ADD UP ALL INPUT PIXELS CONTRIBUTING TO THIS OUTPUT PIXEL:
+                    unsigned int r=0, g=0, b=0, a=0;
+                    for (int y=y1c; y<=y1d; y++)
+                    {
+                        unsigned int weight_y = 256;
+                        if (y1c != y1d) 
+                        {
+                            if (y==y1c)
+                                weight_y = 256 - (y1a & 0xFF);
+                            else if (y==y1d)
+                                weight_y = (y1b & 0xFF);
+                        }
+
+                        byte *dsrc2 = &dsrc[y*w1 + x1c];
+                        for (int x=x1c; x<=x1d; x++)
+                        {
+                            unsigned int weight_x = 256;
+                            if (x1c != x1d) 
+                            {
+                                if (x==x1c)
+                                    weight_x = 256 - (x1a & 0xFF);
+                                else if (x==x1d)
+                                    weight_x = (x1b & 0xFF);
+                            }
+
+                            struct color c = colors[*dsrc2++];  /* R:8 G:8 B:8 format! */
+                            unsigned int r_src = (c.r >> (8 - fb.red.length));
+                            unsigned int g_src = (c.g >> (8 - fb.green.length));
+                            unsigned int b_src = (c.b >> (8 - fb.blue.length));
+
+                            unsigned int w = (weight_x * weight_y) >> weight_shift;
+                            r += r_src * w;
+                            g += g_src * w;
+                            b += b_src * w;
+                            a += w;
+                        }
+                    }
+
+                    // write results
+                    uint32_t pix = (r/a) << fb.red.offset;
+                    pix |= (g/a) << fb.green.offset;
+                    pix |= (b/a) << fb.blue.offset;
+
+                    for (int j = 0; j < fb.bits_per_pixel/8; j++) {
+                        *ddest = (pix >> (j*8));
+                        ddest++;
+                    }
+                }
+            }
+
+        lseek(fd_fb, 0, SEEK_SET);
+        write(fd_fb, I_VideoBuffer_FB, fb.xres * fb.yres * (fb.bits_per_pixel/8));
+        return;
+    }
 
     /* Offsets in case FB is bigger than DOOM */
     /* 600 = fb heigt, 200 screenheight */

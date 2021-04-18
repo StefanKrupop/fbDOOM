@@ -18,6 +18,7 @@ endif
 #CFLAGS+=-fsanitize=address
 OBJS+=$(OBJDIR)/i_video_fbdev.o
 OBJS+=$(OBJDIR)/i_input_tty.o
+#OBJS+=$(OBJDIR)/i_input_gpio.o
 
 CC=$(CROSS_COMPILE)gcc  # gcc or g++
 CFLAGS+=-ggdb3 -Os
